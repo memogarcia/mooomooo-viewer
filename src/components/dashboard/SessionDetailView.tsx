@@ -31,6 +31,16 @@ type TelemetryEvent = {
   snippet?: string | null;
 };
 
+type ToolTokenStat = {
+  name: string;
+  calls: number;
+  totalTokens: number;
+  userTokens: number;
+  cachedTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+};
+
 export const SessionDetailView = ({ detail, refreshing }: SessionDetailProps) => {
   const summary = detail.summary;
   const heroStats = [
@@ -105,6 +115,32 @@ export const SessionDetailView = ({ detail, refreshing }: SessionDetailProps) =>
   }, [detail.tokenTimeline, timelineEvents]);
   const resolvedTimestamp = activeTimestamp ?? fallbackTimestamp;
 
+  const toolTokenStats = useMemo<ToolTokenStat[]>(() => {
+    const map = new Map<string, ToolTokenStat>();
+    for (const event of timelineEvents) {
+      if (event.kind !== "tool" || !event.deltaTokens) continue;
+      const name = event.title || "Tool";
+      const current =
+        map.get(name) ?? {
+          name,
+          calls: 0,
+          totalTokens: 0,
+          userTokens: 0,
+          cachedTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+        };
+      current.calls += 1;
+      current.totalTokens += event.deltaTokens.totalTokens ?? 0;
+      current.userTokens += event.deltaTokens.userTokens ?? 0;
+      current.cachedTokens += event.deltaTokens.cachedTokens ?? 0;
+      current.outputTokens += event.deltaTokens.outputTokens ?? 0;
+      current.reasoningTokens += event.deltaTokens.reasoningTokens ?? 0;
+      map.set(name, current);
+    }
+    return Array.from(map.values()).sort((a, b) => b.totalTokens - a.totalTokens);
+  }, [timelineEvents]);
+
   return (
     <div className="space-y-8">
       <header className="flex flex-col gap-3 border-b border-white/5 pb-6 md:flex-row md:items-end md:justify-between">
@@ -151,6 +187,8 @@ export const SessionDetailView = ({ detail, refreshing }: SessionDetailProps) =>
       <p className="text-xs text-slate-400">
         Reused tokens come from cached input tokens reported by Codex and include both persistent system instructions and repeated user/tool context.
       </p>
+
+      <ToolUsageTable stats={toolTokenStats} />
 
       <div className="full-bleed px-4 sm:px-8">
         <div className="rounded-[32px] border border-white/5 bg-white/5 p-6 shadow-2xl">
@@ -802,4 +840,79 @@ const TIMELINE_KIND_META: Record<TelemetryEvent["kind"], { label: string; dotCla
   file: { label: "file", dotClass: "bg-emerald-300" },
   user: { label: "user", dotClass: "bg-rose-300" },
   agent: { label: "agent", dotClass: "bg-indigo-300" },
+};
+
+const ToolUsageTable = ({ stats }: { stats: ToolTokenStat[] }) => {
+  const totals = stats.reduce(
+    (acc, item) => {
+      acc.totalTokens += item.totalTokens;
+      acc.userTokens += item.userTokens;
+      acc.cachedTokens += item.cachedTokens;
+      acc.outputTokens += item.outputTokens;
+      acc.reasoningTokens += item.reasoningTokens;
+      acc.calls += item.calls;
+      return acc;
+    },
+    { totalTokens: 0, userTokens: 0, cachedTokens: 0, outputTokens: 0, reasoningTokens: 0, calls: 0 }
+  );
+
+  return (
+    <div className="rounded-[32px] border border-white/5 bg-white/5 p-6">
+      <div className="mb-4 flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
+        <div>
+          <p className="text-sm font-semibold text-white">Tool token usage</p>
+          <p className="text-xs text-slate-400">Totals derive from Codex token_count deltas per tool call.</p>
+        </div>
+        {stats.length > 0 && (
+          <p className="text-xs text-slate-400">
+            {totals.calls} calls · {totals.totalTokens.toLocaleString()} model tokens
+          </p>
+        )}
+      </div>
+      {stats.length === 0 ? (
+        <Placeholder text="No tool calls recorded for this session." />
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm text-slate-200">
+            <thead>
+              <tr className="text-xs uppercase tracking-[0.2em] text-slate-500">
+                <th className="py-2 pr-4 font-medium">Tool</th>
+                <th className="py-2 pr-4 font-medium">Calls</th>
+                <th className="py-2 pr-4 font-medium">Model</th>
+                <th className="py-2 pr-4 font-medium">User</th>
+                <th className="py-2 pr-4 font-medium">Output</th>
+                <th className="py-2 pr-4 font-medium">Reasoning</th>
+                <th className="py-2 pr-4 font-medium">Reused</th>
+              </tr>
+            </thead>
+            <tbody>
+              {stats.map((tool) => {
+                const highlight = /mooomooo/i.test(tool.name);
+                return (
+                  <tr key={tool.name} className={clsx("border-t border-white/5", highlight && "text-emerald-300")}> 
+                    <td className="py-2 pr-4 font-semibold">{tool.name}</td>
+                    <td className="py-2 pr-4">{tool.calls.toLocaleString()}</td>
+                    <td className="py-2 pr-4">{tool.totalTokens.toLocaleString()}</td>
+                    <td className="py-2 pr-4">{tool.userTokens.toLocaleString()}</td>
+                    <td className="py-2 pr-4">{tool.outputTokens.toLocaleString()}</td>
+                    <td className="py-2 pr-4">{tool.reasoningTokens.toLocaleString()}</td>
+                    <td className="py-2 pr-4">{tool.cachedTokens.toLocaleString()}</td>
+                  </tr>
+                );
+              })}
+              <tr className="border-t border-white/10 text-slate-300">
+                <td className="py-2 pr-4 font-semibold">Total</td>
+                <td className="py-2 pr-4">{totals.calls.toLocaleString()}</td>
+                <td className="py-2 pr-4">{totals.totalTokens.toLocaleString()}</td>
+                <td className="py-2 pr-4">{totals.userTokens.toLocaleString()}</td>
+                <td className="py-2 pr-4">{totals.outputTokens.toLocaleString()}</td>
+                <td className="py-2 pr-4">{totals.reasoningTokens.toLocaleString()}</td>
+                <td className="py-2 pr-4">{totals.cachedTokens.toLocaleString()}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
 };
