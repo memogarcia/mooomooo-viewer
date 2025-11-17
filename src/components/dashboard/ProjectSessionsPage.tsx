@@ -62,6 +62,9 @@ export function ProjectSessionsPage({ projectId }: Props) {
               <div className="rounded-2xl border border-white/10 bg-white/5 px-5 py-3 text-right text-sm text-slate-300">
                 <p>{project.sessionCount} sessions tracked</p>
                 {project.latestActivityAt && <p>Active {formatRelative(project.latestActivityAt)}</p>}
+                <p>
+                  {project.totalTokens.toLocaleString()} model · {project.billedTokens.toLocaleString()} billed
+                </p>
               </div>
             )}
           </div>
@@ -95,7 +98,8 @@ export function ProjectSessionsPage({ projectId }: Props) {
               <p className="mt-2 text-lg font-semibold text-white">{session.preview}</p>
               <div className="mt-3 flex flex-wrap items-center gap-4 text-sm text-slate-300">
                 <span>Started {formatDate(session.startedAt)}</span>
-                <span>{session.totalTokens.toLocaleString()} tokens</span>
+                <span>{session.totalTokens.toLocaleString()} model</span>
+                <span>{session.billedTokens.toLocaleString()} billed</span>
                 <span>{session.toolCallCount} tool calls</span>
               </div>
             </Link>

@@ -25,9 +25,15 @@ export function ProjectsOverviewPage() {
   const projects = useMemo(() => projectsData?.projects ?? [], [projectsData]);
 
   const aggregate = useMemo(() => {
-    const totalTokens = projects.reduce((sum, project) => sum + project.totalTokens, 0);
-    const totalSessions = projects.reduce((sum, project) => sum + project.sessionCount, 0);
-    return { totalTokens, totalSessions };
+    return projects.reduce(
+      (totals, project) => {
+        totals.totalSessions += project.sessionCount;
+        totals.totalTokens += project.totalTokens;
+        totals.totalBilledTokens += project.billedTokens;
+        return totals;
+      },
+      { totalTokens: 0, totalBilledTokens: 0, totalSessions: 0 }
+    );
   }, [projects]);
 
   return (
@@ -44,7 +50,7 @@ export function ProjectsOverviewPage() {
               <div className="rounded-2xl border border-white/10 bg-white/5 px-5 py-3 text-right text-sm text-slate-300">
                 <p>{projects.length} active projects</p>
                 <p>
-                  {aggregate.totalSessions} sessions · {aggregate.totalTokens.toLocaleString()} tokens
+                  {aggregate.totalSessions} sessions · {aggregate.totalTokens.toLocaleString()} model tokens · {aggregate.totalBilledTokens.toLocaleString()} billed
                 </p>
               </div>
             )}
@@ -82,7 +88,8 @@ export function ProjectsOverviewPage() {
                 <p className="text-sm text-slate-400 break-all">{project.path}</p>
                 <div className="mt-4 flex flex-wrap items-center gap-3 text-sm text-slate-300">
                   <span>{project.sessionCount} sessions</span>
-                  <span>{project.totalTokens.toLocaleString()} tokens</span>
+                  <span>{project.totalTokens.toLocaleString()} model</span>
+                  <span>{project.billedTokens.toLocaleString()} billed</span>
                 </div>
                 <p className="mt-6 inline-flex items-center text-sm font-semibold text-emerald-300">
                   Continue to sessions

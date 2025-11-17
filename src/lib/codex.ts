@@ -1,12 +1,15 @@
 import path from "path";
 import os from "os";
 import { promises as fs } from "fs";
+import type { Stats } from "fs";
 import fg from "fast-glob";
 
 const CODEX_ROOT = process.env.CODEX_ROOT ?? path.join(os.homedir(), ".codex");
 const SESSIONS_ROOT = path.join(CODEX_ROOT, "sessions");
 
 const summaryCache = new Map<string, { mtimeMs: number; summary: SessionSummary }>();
+const SESSION_LIST_CACHE_MS = 5000;
+let sessionListCache: { summaries: SessionSummary[]; expiresAt: number } | null = null;
 
 type TokenUsage = {
   input_tokens: number;
@@ -16,9 +19,21 @@ type TokenUsage = {
   total_tokens: number;
 };
 
+type TokenSnapshot = {
+  totalTokens: number;
+  inputTokens: number;
+  cachedTokens: number;
+  userTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  billedTokens: number;
+};
+
+export type TokenDelta = TokenSnapshot;
+
 type TokenInfo = {
   total_token_usage: TokenUsage;
-  last_token_usage: TokenUsage;
+  last_token_usage?: TokenUsage;
   model_context_window?: number;
 };
 
@@ -67,6 +82,7 @@ export interface SessionSummary {
   lastActivityAt: string;
   preview: string;
   totalTokens: number;
+  billedTokens: number;
   cachedTokens: number;
   userTokens: number;
   outputTokens: number;
@@ -82,6 +98,7 @@ export interface ProjectSummary {
   sessionCount: number;
   latestActivityAt?: string;
   totalTokens: number;
+  billedTokens: number;
 }
 
 export interface ChatMessage {
@@ -101,7 +118,9 @@ export interface TokenTimelinePoint {
   userTokens: number;
   outputTokens: number;
   reasoningTokens: number;
+  billedTokens: number;
   contextWindow?: number;
+  delta: TokenDelta | null;
 }
 
 export interface ToolCall {
@@ -134,6 +153,7 @@ const emptySummary: SessionSummary = {
   lastActivityAt: new Date(0).toISOString(),
   preview: "",
   totalTokens: 0,
+  billedTokens: 0,
   cachedTokens: 0,
   userTokens: 0,
   outputTokens: 0,
@@ -180,6 +200,36 @@ const safeParse = <T>(maybe: string): T | undefined => {
   }
 };
 
+const snapshotFromUsage = (usage?: TokenUsage | null): TokenSnapshot => {
+  if (!usage) {
+    return {
+      totalTokens: 0,
+      inputTokens: 0,
+      cachedTokens: 0,
+      userTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      billedTokens: 0,
+    };
+  }
+  const totalTokens = usage.total_tokens ?? 0;
+  const inputTokens = usage.input_tokens ?? 0;
+  const cachedTokens = usage.cached_input_tokens ?? 0;
+  const userTokens = Math.max(0, inputTokens - cachedTokens);
+  const outputTokens = usage.output_tokens ?? 0;
+  const reasoningTokens = usage.reasoning_output_tokens ?? 0;
+  const billedTokens = userTokens + outputTokens + reasoningTokens;
+  return {
+    totalTokens,
+    inputTokens,
+    cachedTokens,
+    userTokens,
+    outputTokens,
+    reasoningTokens,
+    billedTokens,
+  };
+};
+
 async function listSessionFiles(): Promise<string[]> {
   try {
     const files = await fg("**/*.jsonl", {
@@ -218,11 +268,14 @@ function composePreview(text: string): string {
   return cleaned.length > 180 ? `${cleaned.slice(0, 177)}...` : cleaned;
 }
 
-async function parseSessionSummary(filePath: string): Promise<SessionSummary | null> {
+async function parseSessionSummary(
+  filePath: string,
+  options?: { events?: CodexEvent[]; stat?: Stats | null }
+): Promise<SessionSummary | null> {
   const sessionId = extractSessionId(filePath);
   if (!sessionId) return null;
 
-  const stat = await fs.stat(filePath).catch(() => null);
+  const stat = options?.stat ?? (await fs.stat(filePath).catch(() => null));
   if (!stat) return null;
 
   const cached = summaryCache.get(filePath);
@@ -230,7 +283,7 @@ async function parseSessionSummary(filePath: string): Promise<SessionSummary | n
     return cached.summary;
   }
 
-  const events = await readJsonl(filePath);
+  const events = options?.events ?? (await readJsonl(filePath));
   let meta: SessionMetaPayload | null = null;
   let preview = "";
   let startedAt = "";
@@ -282,6 +335,8 @@ async function parseSessionSummary(filePath: string): Promise<SessionSummary | n
 
   if (!meta) return null;
 
+  const snapshot = snapshotFromUsage(tokens);
+
   const summary: SessionSummary = {
     id: sessionId,
     projectId: slugify(meta.cwd ?? "unknown"),
@@ -291,11 +346,12 @@ async function parseSessionSummary(filePath: string): Promise<SessionSummary | n
     startedAt: startedAt || meta.timestamp || new Date(0).toISOString(),
     lastActivityAt: lastActivityAt || startedAt || meta.timestamp || new Date(0).toISOString(),
     preview: preview || "(no prompt logged)",
-    totalTokens: tokens?.total_tokens ?? 0,
-    cachedTokens: tokens?.cached_input_tokens ?? 0,
-    userTokens: tokens ? Math.max(0, tokens.input_tokens - tokens.cached_input_tokens) : 0,
-    outputTokens: tokens?.output_tokens ?? 0,
-    reasoningTokens: tokens?.reasoning_output_tokens ?? 0,
+    totalTokens: snapshot.totalTokens,
+    billedTokens: snapshot.billedTokens,
+    cachedTokens: snapshot.cachedTokens,
+    userTokens: snapshot.userTokens,
+    outputTokens: snapshot.outputTokens,
+    reasoningTokens: snapshot.reasoningTokens,
     contextWindow,
     toolCallCount: toolCalls.size,
   };
@@ -305,13 +361,18 @@ async function parseSessionSummary(filePath: string): Promise<SessionSummary | n
 }
 
 export async function getSessionSummaries(): Promise<SessionSummary[]> {
+  if (sessionListCache && sessionListCache.expiresAt > Date.now()) {
+    return sessionListCache.summaries;
+  }
   const files = await listSessionFiles();
   const summaries: SessionSummary[] = [];
   for (const file of files) {
     const summary = await parseSessionSummary(file);
     if (summary) summaries.push(summary);
   }
-  return summaries.sort((a, b) => (a.lastActivityAt < b.lastActivityAt ? 1 : -1));
+  const sorted = summaries.sort((a, b) => (a.lastActivityAt < b.lastActivityAt ? 1 : -1));
+  sessionListCache = { summaries: sorted, expiresAt: Date.now() + SESSION_LIST_CACHE_MS };
+  return sorted;
 }
 
 export async function getProjectSummaries(): Promise<ProjectSummary[]> {
@@ -325,9 +386,11 @@ export async function getProjectSummaries(): Promise<ProjectSummary[]> {
       sessionCount: 0,
       latestActivityAt: undefined,
       totalTokens: 0,
+      billedTokens: 0,
     };
     current.sessionCount += 1;
     current.totalTokens += session.totalTokens;
+    current.billedTokens += session.billedTokens;
     if (!current.latestActivityAt || current.latestActivityAt < session.lastActivityAt) {
       current.latestActivityAt = session.lastActivityAt;
     }
@@ -477,16 +540,20 @@ function buildTokenTimeline(events: CodexEvent[]): TokenTimelinePoint[] {
     if (payload?.type === "token_count" && payload.info && payload.info.total_token_usage) {
       const total = payload.info.total_token_usage;
       const timestamp = typeof event.timestamp === "string" ? event.timestamp : new Date(0).toISOString();
+      const snapshot = snapshotFromUsage(total);
+      const delta = payload.info.last_token_usage ? snapshotFromUsage(payload.info.last_token_usage) : null;
       points.push({
         timestamp,
         timestampMs: new Date(timestamp).getTime(),
-        totalTokens: total.total_tokens,
-        inputTokens: total.input_tokens,
-        cachedTokens: total.cached_input_tokens,
-        userTokens: Math.max(0, total.input_tokens - total.cached_input_tokens),
-        outputTokens: total.output_tokens,
-        reasoningTokens: total.reasoning_output_tokens,
+        totalTokens: snapshot.totalTokens,
+        inputTokens: snapshot.inputTokens,
+        cachedTokens: snapshot.cachedTokens,
+        userTokens: snapshot.userTokens,
+        outputTokens: snapshot.outputTokens,
+        reasoningTokens: snapshot.reasoningTokens,
+        billedTokens: snapshot.billedTokens,
         contextWindow: payload.info.model_context_window,
+        delta,
       });
     }
   }
@@ -501,8 +568,10 @@ async function findSessionFile(sessionId: string): Promise<string | undefined> {
 export async function getSessionDetail(sessionId: string): Promise<SessionDetail | null> {
   const filePath = await findSessionFile(sessionId);
   if (!filePath) return null;
+  const stat = await fs.stat(filePath).catch(() => null);
+  if (!stat) return null;
   const events = await readJsonl(filePath);
-  const summary = (await parseSessionSummary(filePath)) ?? emptySummary;
+  const summary = (await parseSessionSummary(filePath, { events, stat })) ?? emptySummary;
   const tokenTimeline = buildTokenTimeline(events);
   const { toolCalls } = buildToolCalls(events);
   const messages = buildMessages(events);

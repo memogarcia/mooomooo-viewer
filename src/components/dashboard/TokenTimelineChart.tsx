@@ -9,8 +9,9 @@ import {
   YAxis,
   Scatter,
   Legend,
+  ReferenceLine,
 } from "recharts";
-import type { TokenTimelinePoint, ToolCall } from "@/lib/codex";
+import type { TokenDelta, TokenTimelinePoint, ToolCall } from "@/lib/codex";
 import { useMemo, useState } from "react";
 import clsx from "clsx";
 
@@ -22,7 +23,7 @@ const palette = {
 };
 
 export const TOKEN_SERIES_META: Array<{ key: TokenSeriesKey; label: string; color: string }> = [
-  { key: "cached", label: "System (cached)", color: palette.cached },
+  { key: "cached", label: "Reused (cached)", color: palette.cached },
   { key: "user", label: "User", color: palette.user },
   { key: "output", label: "Output", color: palette.output },
   { key: "reasoning", label: "Reasoning", color: palette.reasoning },
@@ -31,7 +32,7 @@ export const TOKEN_SERIES_META: Array<{ key: TokenSeriesKey; label: string; colo
 export type ToolCallInsight = {
   anchorTimestamp: number | null;
   eventTimestamp: number | null;
-  deltaTokens: number | null;
+  deltaTokens: TokenDelta | null;
 };
 
 const formatTime = (value: number) => {
@@ -45,9 +46,11 @@ interface TokenTimelineChartProps {
   timeline: TokenTimelinePoint[];
   toolCalls: ToolCall[];
   onSelectTimestamp?: (timestamp: number | null) => void;
+  onHoverTimestamp?: (timestamp: number | null) => void;
   hiddenSeries?: Partial<Record<TokenSeriesKey, boolean>>;
   className?: string;
   toolInsights?: Record<string, ToolCallInsight>;
+  activeTimestamp?: number | null;
 }
 
 type ChartDatum = {
@@ -61,6 +64,8 @@ type ChartDatum = {
   contextWindow?: number;
 };
 
+type ContextRange = { before: number; after: number };
+
 type ToolMarker = {
   markerType: "tool";
   time: number;
@@ -69,7 +74,8 @@ type ToolMarker = {
   status: string;
   callId: string;
   infoSnippet?: string | null;
-  contextDelta?: number | null;
+  contextDelta?: TokenDelta | null;
+  contextRange?: ContextRange | null;
 };
 
 type ChartPointerState = {
@@ -80,9 +86,11 @@ export function TokenTimelineChart({
   timeline,
   toolCalls,
   onSelectTimestamp,
+  onHoverTimestamp,
   hiddenSeries,
   className,
   toolInsights,
+  activeTimestamp,
 }: TokenTimelineChartProps) {
   const [hoverTimelinePoint, setHoverTimelinePoint] = useState<ChartDatum | null>(null);
   const [hoverToolMarker, setHoverToolMarker] = useState<ToolMarker | null>(null);
@@ -108,6 +116,12 @@ export function TokenTimelineChart({
     return [start, end] as const;
   }, [chartData]);
 
+  const timelineLookup = useMemo(() => {
+    const map = new Map<number, ChartDatum>();
+    chartData.forEach((point) => map.set(point.time, point));
+    return map;
+  }, [chartData]);
+
   const toolMarkers = useMemo(
     () =>
       toolCalls
@@ -117,6 +131,11 @@ export function TokenTimelineChart({
           if (anchorMs === null && displayMs === null) return null;
           const time = clampToDomain(anchorMs ?? displayMs, domainStart, domainEnd);
           if (time === null) return null;
+          const anchorPoint = anchorMs ? timelineLookup.get(anchorMs) : anchorMs === null ? null : timelineLookup.get(time);
+          const delta = toolInsights?.[call.id]?.deltaTokens ?? null;
+          const range = anchorPoint && delta
+            ? computeContextRange(delta, anchorPoint.total)
+            : null;
           return {
             markerType: "tool" as const,
             time,
@@ -125,11 +144,12 @@ export function TokenTimelineChart({
             status: call.status,
             callId: call.id,
             infoSnippet: pickSnippet(call),
-            contextDelta: toolInsights?.[call.id]?.deltaTokens ?? null,
+            contextDelta: delta,
+            contextRange: range,
           } satisfies ToolMarker;
         })
         .filter((marker): marker is ToolMarker => Boolean(marker)),
-    [toolCalls, toolInsights, domainStart, domainEnd]
+    [toolCalls, toolInsights, domainStart, domainEnd, timelineLookup]
   );
 
   if (!chartData.length) {
@@ -153,10 +173,13 @@ export function TokenTimelineChart({
             const toolEntry = payloads.find((entry) => isToolMarker(entry.payload))?.payload as ToolMarker | undefined;
             setHoverTimelinePoint(timelineEntry ?? null);
             setHoverToolMarker(toolEntry ?? null);
+            const nextTimestamp = timelineEntry?.time ?? toolEntry?.displayTime ?? toolEntry?.time ?? null;
+            onHoverTimestamp?.(nextTimestamp ?? null);
           }}
           onMouseLeave={() => {
             setHoverTimelinePoint(null);
             setHoverToolMarker(null);
+            onHoverTimestamp?.(null);
           }}
           onClick={() => {
             if (!onSelectTimestamp) return;
@@ -202,13 +225,22 @@ export function TokenTimelineChart({
             )}
           />
           <Legend wrapperStyle={{ color: "#cbd5f5" }} />
+          {typeof activeTimestamp === "number" && (
+            <ReferenceLine
+              x={activeTimestamp}
+              yAxisId="tokens"
+              stroke="#38bdf8"
+              strokeDasharray="4 4"
+              strokeWidth={2}
+            />
+          )}
           <Area
             dataKey="cached"
             yAxisId="tokens"
             stackId="tokens"
             stroke={palette.cached}
             fill="url(#gradient-cached)"
-            name="System (cached)"
+            name="Reused (cached)"
             hide={Boolean(hiddenSeries?.cached)}
           />
           <Area
@@ -268,11 +300,14 @@ const TokenTooltip = ({ active, payload, hiddenSeries, fallbackPoint, fallbackTo
   const toolPayload = entries.find((entry) => isToolMarker(entry.payload))?.payload as ToolMarker | undefined;
   const point = timelinePayload ?? fallbackPoint;
   const toolCall = toolPayload ?? fallbackToolCall ?? null;
+  const toolContextText = toolCall?.contextDelta
+    ? formatContextChange(toolCall.contextDelta, toolCall.contextRange)
+    : null;
   if (!active && !point && !toolCall) return null;
   if (!point && !toolCall) return null;
   const rows = point
     ? ([
-        { key: "cached" as TokenSeriesKey, label: "System (cached)", value: point.cached },
+        { key: "cached" as TokenSeriesKey, label: "Reused (cached)", value: point.cached },
         { key: "user" as TokenSeriesKey, label: "User", value: point.user },
         { key: "output" as TokenSeriesKey, label: "Output", value: point.output },
         { key: "reasoning" as TokenSeriesKey, label: "Reasoning", value: point.reasoning },
@@ -301,25 +336,20 @@ const TokenTooltip = ({ active, payload, hiddenSeries, fallbackPoint, fallbackTo
           )}
         </>
       )}
-      {toolCall && (
-        <div className={clsx(point && "mt-3", "border-t border-white/10 pt-3 text-left text-xs text-slate-300")}>
-          <p className="text-[11px] uppercase tracking-[0.3em] text-slate-500">Tool call</p>
-          <div className="mt-1 flex items-center justify-between gap-4 text-sm">
-            <span className="font-semibold text-white">{toolCall.name}</span>
-            {toolCall.displayTime && <span className="text-xs text-slate-400">{formatTime(toolCall.displayTime)}</span>}
-          </div>
-          <p className="text-[11px] uppercase tracking-[0.2em] text-slate-500">Status: {toolCall.status}</p>
-          {typeof toolCall.contextDelta === "number" && (
-            <p className="mt-1 text-xs text-slate-200">
-              Context {toolCall.contextDelta >= 0 ? "+" : ""}
-              {toolCall.contextDelta.toLocaleString()} tokens
-            </p>
-          )}
-          {toolCall.infoSnippet && (
-            <div className="mt-2 max-h-28 overflow-y-auto rounded-xl bg-black/40 px-3 py-2 text-[11px] text-slate-100">
-              {toolCall.infoSnippet}
-            </div>
-          )}
+          {toolCall && (
+            <div className={clsx(point && "mt-3", "border-t border-white/10 pt-3 text-left text-xs text-slate-300")}>
+              <p className="text-[11px] uppercase tracking-[0.3em] text-slate-500">Tool call</p>
+              <div className="mt-1 flex items-center justify-between gap-4 text-sm">
+                <span className="font-semibold text-white">{toolCall.name}</span>
+                {toolCall.displayTime && <span className="text-xs text-slate-400">{formatTime(toolCall.displayTime)}</span>}
+              </div>
+              <p className="text-[11px] uppercase tracking-[0.2em] text-slate-500">Status: {toolCall.status}</p>
+              {toolContextText && <p className="mt-1 text-xs text-slate-200">Context {toolContextText}</p>}
+              {toolCall.infoSnippet && (
+                <div className="mt-2 max-h-28 overflow-y-auto rounded-xl bg-black/40 px-3 py-2 text-[11px] text-slate-100">
+                  {toolCall.infoSnippet}
+                </div>
+              )}
         </div>
       )}
     </div>
@@ -363,3 +393,26 @@ const pickSnippet = (call: ToolCall) => {
 };
 
 const truncate = (value: string, max = 200) => (value.length > max ? `${value.slice(0, max)}…` : value);
+
+const computeContextRange = (delta: TokenDelta, afterTotal: number | null) => {
+  if (afterTotal === null || typeof afterTotal !== "number") return null;
+  const before = afterTotal - delta.totalTokens;
+  return { before, after: afterTotal } satisfies ContextRange;
+};
+
+const formatContextChange = (delta: TokenDelta, range?: ContextRange | null) => {
+  const total = delta.totalTokens ?? 0;
+  const prefix = total >= 0 ? "+" : "";
+  const base = `${prefix}${total.toLocaleString()} tokens`;
+  const breakdown = [
+    { label: "User", value: delta.userTokens },
+    { label: "Reused", value: delta.cachedTokens },
+    { label: "Output", value: delta.outputTokens },
+    { label: "Reasoning", value: delta.reasoningTokens },
+  ]
+    .filter((segment) => segment.value)
+    .map((segment) => `${segment.label} ${segment.value >= 0 ? "+" : ""}${segment.value.toLocaleString()}`)
+    .join(" · ");
+  const span = range ? `${range.before.toLocaleString()} → ${range.after.toLocaleString()}` : "Δ";
+  return `${span} (${breakdown ? `${base} · ${breakdown}` : base})`;
+};
